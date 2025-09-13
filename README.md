@@ -165,3 +165,201 @@ Y  = A @ V
 ### TL;DR
 
 Attention with Differentiable Adaptive Resonance = **standard scaled dot-product attention** plus a **bounded, smooth, cosine-selective logit prior** $\lambda\,\sigma(\alpha(c-\rho))$. It’s **fully differentiable**, **parameter-free** (in the minimal form), **stable** under mild conditions when made dynamic, and **compatible** with existing pretrained models while offering interpretable, margin-based control of attention selectivity.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from math import sqrt
+
+class DARAttention(nn.Module):
+    """
+    GPT-2 style multi-head attention with a parameter-free, differentiable
+    adaptive resonance (DAR) bias added to the logits.
+
+        cos_ij = cosine(q_i, k_j)
+        r_ij   = sigmoid(alpha * (cos_ij - rho))
+        logits += lam * r_ij
+
+    - Set lam=0 for vanilla attention.
+    - Adds no new learnable tensors beyond standard GPT-2 (c_attn/c_proj).
+    - Uses dtype-safe masking for stability in fp16/bf16.
+    """
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int,
+        *,
+        attn_dropout: float = 0.0,
+        resid_dropout: float = 0.0,
+        bias_qkv: bool = True,
+        bias_proj: bool = True,
+        lam: float = 0.3,
+        rho: float = 0.6,
+        alpha: float = 8.0,
+        iters: int = 0,
+        beta: float = 0.5,
+    ):
+        super().__init__()
+        assert dim % n_heads == 0, "dim must be divisible by n_heads"
+        self.dim = dim
+        self.n_heads = n_heads
+        self.dh = dim // n_heads
+
+        # Match GPT-2 shapes (bias=True to align with common checkpoints)
+        self.c_attn = nn.Linear(dim, 3 * dim, bias=bias_qkv)
+        self.c_proj = nn.Linear(dim, dim, bias=bias_proj)
+        self.attn_drop = nn.Dropout(attn_dropout)
+        self.resid_drop = nn.Dropout(resid_dropout)
+
+        # DAR hyperparams (not in state_dict)
+        self.lam = float(lam)      # resonance strength
+        self.rho = float(rho)      # vigilance threshold (cosine)
+        self.alpha = float(alpha)  # gate sharpness
+        self.iters = int(iters)    # unrolled refinement steps (0..2 recommended)
+        self.beta = float(beta)    # recurrence weight if iters>0
+
+    def _causal_mask(self, T: int, device: torch.device) -> torch.Tensor:
+        return torch.ones(T, T, device=device, dtype=torch.bool).tril_()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        qkv = self.c_attn(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        def split_heads(t: torch.Tensor) -> torch.Tensor:
+            return t.view(B, T, self.n_heads, self.dh).transpose(1, 2)
+        q, k, v = map(split_heads, (q, k, v))  # (B,H,T,dh)
+
+        # Base scaled dot-product logits
+        scores = torch.matmul(q, k.transpose(-2, -1)) / sqrt(self.dh)  # (B,H,T,T)
+
+        # Differentiable adaptive resonance bias (parameter-free)
+        if self.lam != 0.0:
+            eps = 1e-8
+            qn = q / (q.norm(dim=-1, keepdim=True) + eps)
+            kn = k / (k.norm(dim=-1, keepdim=True) + eps)
+            cos = torch.einsum("bhid,bhjd->bhij", qn, kn)  # cosine in [-1,1]
+            if self.iters > 0:
+                r = torch.zeros_like(cos)
+                for _ in range(self.iters):
+                    r = torch.sigmoid(self.alpha * (cos + self.beta * r - self.rho))
+            else:
+                r = torch.sigmoid(self.alpha * (cos - self.rho))
+            scores = scores + self.lam * r
+
+        # Causal mask (dtype-safe)
+        mask = self._causal_mask(T, x.device).view(1, 1, T, T)
+        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+
+        # Attention + output
+        attn = F.softmax(scores, dim=-1)
+        attn = self.attn_drop(attn)
+        ctx = torch.matmul(attn, v)  # (B,H,T,dh)
+
+        # Merge heads
+        ctx = ctx.transpose(1, 2).contiguous().view(B, T, self.dim)
+        out = self.c_proj(ctx)
+        out = self.resid_drop(out)
+        return out
+
+
+class GPT2_ARA(nn.Module):
+    """
+    Minimal GPT-2 stack with DARAttention blocks.
+
+    Args:
+        vocab_size: tokenizer vocab size.
+        dim: model width.
+        depth: number of transformer blocks.
+        n_heads: number of attention heads.
+        max_pos: maximum sequence length for positional embeddings.
+        lam, rho, alpha, iters, beta: DAR hyperparameters (see DARAttention).
+        attn_dropout, resid_dropout: dropout probabilities.
+        bias_qkv, bias_proj: include bias on qkv/proj (True to match GPT-2).
+        weight_tying: tie lm_head.weight to token embedding weights.
+    """
+    def __init__(
+        self,
+        vocab_size: int,
+        *,
+        dim: int = 256,
+        depth: int = 4,
+        n_heads: int = 4,
+        max_pos: int = 2048,
+        lam: float = 0.3,
+        rho: float = 0.6,
+        alpha: float = 8.0,
+        iters: int = 0,
+        beta: float = 0.5,
+        attn_dropout: float = 0.0,
+        resid_dropout: float = 0.0,
+        bias_qkv: bool = True,
+        bias_proj: bool = True,
+        weight_tying: bool = True,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.depth = depth
+        self.n_heads = n_heads
+
+        self.embed = nn.Embedding(vocab_size, dim)
+        self.pos_emb = nn.Embedding(max_pos, dim)
+
+        self.blocks = nn.ModuleList([
+            nn.ModuleDict({
+                "ln1": nn.LayerNorm(dim, eps=1e-5),
+                "attn": DARAttention(
+                    dim, n_heads,
+                    attn_dropout=attn_dropout, resid_dropout=resid_dropout,
+                    bias_qkv=bias_qkv, bias_proj=bias_proj,
+                    lam=lam, rho=rho, alpha=alpha, iters=iters, beta=beta
+                ),
+                "ln2": nn.LayerNorm(dim, eps=1e-5),
+                "mlp": nn.Sequential(
+                    nn.Linear(dim, 4 * dim, bias=True),
+                    nn.GELU(),
+                    nn.Linear(4 * dim, dim, bias=True),
+                ),
+            }) for _ in range(depth)
+        ])
+
+        self.ln_f = nn.LayerNorm(dim, eps=1e-5)
+        self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+        if weight_tying:
+            self.lm_head.weight = self.embed.weight
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m: nn.Module) -> None:
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+        if isinstance(m, nn.Linear) and m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # Strict validation to catch common pitfalls early
+        if not torch.is_tensor(input_ids):
+            raise ValueError("input_ids must be a torch.Tensor.")
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)  # (1, T)
+        if input_ids.dim() != 2:
+            raise ValueError("Expected input with 2 dims (B, T).")
+        if input_ids.dtype != torch.long:
+            raise ValueError("input_ids must be dtype torch.long (token ids).")
+
+        B, T = input_ids.shape
+        if T >= self.pos_emb.num_embeddings:
+            raise ValueError("Sequence length exceeds positional embedding size.")
+
+        pos = torch.arange(T, device=input_ids.device).unsqueeze(0)  # (1, T)
+        h = self.embed(input_ids) + self.pos_emb(pos)
+
+        for blk in self.blocks:
+            h = h + blk["attn"](blk["ln1"](h))
+            h = h + blk["mlp"](blk["ln2"](h))
+
+        h = self.ln_f(h)
+        return self.lm_head(h)  # (B, T, vocab_size)
+```
